@@ -10,6 +10,7 @@ from telegram import Update, MessageOriginUser, MessageOriginHiddenUser
 from telegram.ext import (
     Application,
     CommandHandler,
+    ConversationHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -240,48 +241,63 @@ def _build_fwd_description(origin, fwd_text: str) -> str:
     return f"Forwarded from {name} on {date_str}:\n\n{fwd_text}"
 
 
+WAITING_FOR_TASK = 1
+
+
+async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive a forwarded message and prompt for task details."""
+    message = update.message
+    if not message:
+        return ConversationHandler.END
+
+    origin = getattr(message, "forward_origin", None)
+    fwd_text = message.text or message.caption or ""
+    description = _build_fwd_description(origin, fwd_text) if fwd_text and origin else None
+
+    context.user_data["fwd_description"] = description
+
+    await message.reply_text(
+        "Got it! Now send me the task name and flags.\n"
+        "Example: `Fix the thing;u h`\n\n"
+        "Send /cancel to abort.",
+        parse_mode="Markdown",
+    )
+    return WAITING_FOR_TASK
+
+
+async def handle_task_after_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive task;flags after a forwarded message and create the issue."""
+    message = update.message
+    task_input = message.text or message.caption or ""
+    if not task_input:
+        return WAITING_FOR_TASK
+
+    description = context.user_data.pop("fwd_description", None)
+    await _create_and_reply(message, task_input, description)
+    return ConversationHandler.END
+
+
+async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("fwd_description", None)
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle regular (non-forwarded) messages."""
     message = update.message
     if not message:
         return
 
-    origin = getattr(message, "forward_origin", None)
-    reply = message.reply_to_message
-    reply_origin = getattr(reply, "forward_origin", None) if reply else None
+    raw = message.text or message.caption or ""
+    if not raw:
+        return
 
-    if reply_origin:
-        # User replied to a forwarded message with task;flags — the intended flow.
-        # The reply text is the task input; the original forwarded message is the description.
-        task_input = message.text or message.caption or ""
-        if not task_input:
-            return
-        fwd_text = reply.text or reply.caption or ""
-        description = _build_fwd_description(reply_origin, fwd_text) if fwd_text else None
+    await _create_and_reply(message, raw, description=None)
 
-    elif origin:
-        # Bare forwarded message (no reply-based task input).
-        # For media with a user caption, treat caption as task;flags.
-        # For plain text forwards, silently ignore — user should reply with task;flags.
-        if message.caption:
-            task_input = message.caption
-            description = _build_fwd_description(origin, message.text or "")
-        else:
-            # Plain text forward with no caption — prompt user to reply with task;flags
-            await message.reply_text(
-                "Reply to this message with your task name and flags to create a Linear issue.\n"
-                "Example: `Fix the thing;u h`",
-                parse_mode="Markdown",
-            )
-            return
 
-    else:
-        # Regular message
-        raw = message.text or message.caption or ""
-        if not raw:
-            return
-        task_input = raw
-        description = None
-
+async def _create_and_reply(message, task_input: str, description: str | None) -> None:
+    """Parse task input, create a Linear issue, and reply."""
     parsed = parse_message(task_input)
     if isinstance(parsed, str):
         await message.reply_text(parsed)
@@ -348,9 +364,32 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", handle_start, filters=allowed))
     app.add_handler(CommandHandler("help", handle_help, filters=allowed))
+
+    # Forwarded messages: two-step conversation (forward → task;flags)
+    conv_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(
+                allowed & filters.FORWARDED & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
+                handle_forward,
+            ),
+        ],
+        states={
+            WAITING_FOR_TASK: [
+                CommandHandler("cancel", handle_cancel),
+                MessageHandler(
+                    allowed & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
+                    handle_task_after_forward,
+                ),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", handle_cancel)],
+    )
+    app.add_handler(conv_handler)
+
+    # Regular (non-forwarded) messages
     app.add_handler(
         MessageHandler(
-            allowed & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
+            allowed & ~filters.FORWARDED & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
             handle_message,
         )
     )
